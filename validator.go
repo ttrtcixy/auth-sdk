@@ -5,15 +5,20 @@ import (
 	"crypto"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
 	ErrAccessTokenExpired    = errors.New("access token is expired")
 	ErrInvalidAccessToken    = errors.New("access token is invalid")
 	ErrTokenSignatureInvalid = errors.New("access token invalid signature")
+	ErrInvalidTokenUserInfo  = errors.New("access token invalid user info")
+	ErrAlreadyUpdate         = errors.New("public keys already update")
 )
 
 type KeyGetter interface {
@@ -23,14 +28,20 @@ type KeyGetter interface {
 type TokenValidator struct {
 	keyGetter KeyGetter
 
+	lastUpdate time.Time
+	refreshTTL time.Duration
+
+	group      singleflight.Group
 	mu         sync.RWMutex
 	publicKeys map[string]crypto.PublicKey
 }
 
 func NewTokenValidator(keyGetter KeyGetter) *TokenValidator {
 	return &TokenValidator{
-		keyGetter: keyGetter,
-		mu:        sync.RWMutex{},
+		keyGetter:  keyGetter,
+		mu:         sync.RWMutex{},
+		group:      singleflight.Group{},
+		refreshTTL: 10 * time.Second,
 	}
 }
 
@@ -46,22 +57,33 @@ type AccessTokenClaims struct {
 	jwt.RegisteredClaims
 }
 
-func (t *TokenValidator) ParseAccessToken(jwtToken string) (result *AccessTokenClaims, err error) {
-	token, err := t.parse(jwtToken, &AccessTokenClaims{})
+func (c *AccessTokenClaims) Validate() error {
+	if c == nil {
+		return errors.New("claims are nil")
+	}
+
+	if c.UserID == "" || c.RoleId == "" || c.Username == "" || c.Email == "" {
+		return ErrInvalidTokenUserInfo
+	}
+	return nil
+}
+
+var _ jwt.ClaimsValidator = &AccessTokenClaims{}
+
+func (t *TokenValidator) ParseAccessToken(ctx context.Context, jwtToken string) (result *AccessTokenClaims, err error) {
+	token, err := jwt.ParseWithClaims(jwtToken, &AccessTokenClaims{}, t.keyFunc(ctx), jwt.WithExpirationRequired())
 	if err != nil {
-		if errors.Is(err, jwt.ErrTokenExpired) {
+		switch {
+		case errors.Is(err, jwt.ErrTokenRequiredClaimMissing) || errors.Is(err, jwt.ErrTokenMalformed) || errors.Is(err, ErrInvalidTokenUserInfo):
+			return nil, ErrInvalidAccessToken
+		case errors.Is(err, jwt.ErrTokenExpired):
 			return nil, ErrAccessTokenExpired
-		}
-		if errors.Is(err, jwt.ErrSignatureInvalid) {
-			return nil, ErrInvalidAccessToken
-		}
-		if errors.Is(err, jwt.ErrTokenMalformed) {
-			return nil, ErrInvalidAccessToken
-		}
-		if errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		case errors.Is(err, jwt.ErrTokenSignatureInvalid):
 			return nil, ErrTokenSignatureInvalid
+		default:
+			slog.Log(ctx, slog.LevelError, "parser access jwt error", slog.String("error", err.Error()))
+			return nil, err
 		}
-		return nil, err
 	}
 
 	claims, ok := token.Claims.(*AccessTokenClaims)
@@ -69,22 +91,10 @@ func (t *TokenValidator) ParseAccessToken(jwtToken string) (result *AccessTokenC
 		return nil, ErrInvalidAccessToken
 	}
 
-	if claims.UserID == "" {
-		return nil, ErrInvalidAccessToken
-	}
-
-	if claims.Username == "" {
-		return nil, ErrInvalidAccessToken
-	}
-
-	if claims.Email == "" {
-		return nil, ErrInvalidAccessToken
-	}
-
 	return claims, nil
 }
 
-func (t *TokenValidator) keyFunc() jwt.Keyfunc {
+func (t *TokenValidator) keyFunc(ctx context.Context) jwt.Keyfunc {
 	return func(token *jwt.Token) (any, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -95,26 +105,42 @@ func (t *TokenValidator) keyFunc() jwt.Keyfunc {
 			return nil, errors.New("invalid access token")
 		}
 
-		return t.getKey(keyID)
+		return t.getKey(ctx, keyID)
 	}
 }
 
-func (t *TokenValidator) getKey(keyID string) (crypto.PublicKey, error) {
-	const op = "auth_sdk.getKey"
+func (t *TokenValidator) getKey(_ context.Context, keyID string) (crypto.PublicKey, error) {
 	if key, ok := t.keyByID(keyID); ok {
 		return key, nil
 	}
 
-	// todo защита от постоянных запросов с невалидными токенами
-	// todo только один запрос если сразу несколько вызывают
-	keys, err := t.keyGetter.PublicKeys(nil)
-	if err != nil {
-		return nil, fmt.Errorf("%s -> %w", op, err)
-	}
+	_, err, _ := t.group.Do("update_keys", func() (interface{}, error) {
+		t.mu.RLock()
+		lastUpdate := t.lastUpdate
+		t.mu.RUnlock()
 
-	t.mu.Lock()
-	t.publicKeys = keys
-	t.mu.Unlock()
+		if time.Since(lastUpdate) < t.refreshTTL {
+			return nil, ErrAlreadyUpdate
+		}
+
+		keys, err := t.keyGetter.PublicKeys(context.Background())
+		if err != nil {
+			return nil, err
+		}
+
+		t.mu.Lock()
+		t.lastUpdate = time.Now()
+		t.publicKeys = keys
+		t.mu.Unlock()
+
+		return nil, nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrAlreadyUpdate) {
+			return nil, ErrInvalidAccessToken
+		}
+		return nil, err
+	}
 
 	if key, ok := t.keyByID(keyID); ok {
 		return key, nil
@@ -127,18 +153,6 @@ func (t *TokenValidator) keyByID(keyID string) (crypto.PublicKey, bool) {
 	t.mu.RLock()
 	key, ok := t.publicKeys[keyID]
 	t.mu.RUnlock()
-	if ok {
-		return key, true
-	}
 
-	return "", false
-}
-
-func (t *TokenValidator) parse(jwtToken string, claims jwt.Claims) (token *jwt.Token, err error) {
-	token, err = jwt.ParseWithClaims(jwtToken, claims, t.keyFunc()) // todo другие проверки
-	if err != nil {
-		return nil, err
-	}
-
-	return token, nil
+	return key, ok
 }
