@@ -81,7 +81,7 @@ func (t *TokenValidator) ParseAccessToken(ctx context.Context, jwtToken string) 
 		case errors.Is(err, jwt.ErrTokenSignatureInvalid):
 			return nil, ErrTokenSignatureInvalid
 		default:
-			slog.Log(ctx, slog.LevelError, "parser access jwt error", slog.String("error", err.Error()))
+			slog.Log(ctx, slog.LevelError, "parser access tokens error", slog.String("error", err.Error()))
 			return nil, err
 		}
 	}
