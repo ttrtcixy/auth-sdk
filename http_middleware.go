@@ -63,6 +63,7 @@ func (ac *AuthClient) AuthMiddleware() func(handler http.Handler) http.Handler {
 					msg = tokenExpired
 				} else {
 					ac.log.LogAttrs(r.Context(), slog.LevelWarn, "suspicious token",
+						slog.String("token", accessToken),
 						slog.String("error", err.Error()),
 						slog.String("remote_addr", r.RemoteAddr),
 					)
