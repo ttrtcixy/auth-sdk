@@ -139,7 +139,12 @@ func (ac *AuthClient) reconnect(ctx context.Context) {
 		default:
 			if err := ac.connect(); err != nil {
 				recAttempts++
-				ac.log.Error("%s: grpc auth server is not available, reconnection attempt %d, err: %w", op, recAttempts, err)
+				ac.log.Error(
+					"%s: grpc auth server is not available, reconnection attempt %d, err: %w",
+					op,
+					recAttempts,
+					err,
+				)
 				continue
 			}
 
